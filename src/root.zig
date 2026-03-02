@@ -31,6 +31,7 @@ pub const channel_catalog = @import("channel_catalog.zig");
 pub const migration = @import("migration.zig");
 pub const sse_client = @import("sse_client.zig");
 pub const update = @import("update.zig");
+pub const export_manifest = @import("export_manifest.zig");
 
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");

@@ -772,9 +772,9 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
     return num - 1;
 }
 
-const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
-const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
-const wizard_memory_backend_order = [_][]const u8{
+pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
+pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+pub const wizard_memory_backend_order = [_][]const u8{
     "sqlite",
     "markdown",
     "memory",
