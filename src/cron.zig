@@ -77,6 +77,8 @@ pub const DeliveryConfig = struct {
     channel: ?[]const u8 = null,
     to: ?[]const u8 = null,
     best_effort: bool = true,
+    channel_owned: bool = false,
+    to_owned: bool = false,
 };
 
 pub const CronRun = struct {
@@ -421,6 +423,12 @@ pub const CronScheduler = struct {
         if (job.name) |name| self.allocator.free(name);
         if (job.model) |model| self.allocator.free(model);
         if (job.last_output) |output| self.allocator.free(output);
+        if (job.delivery.channel_owned) {
+            if (job.delivery.channel) |channel| self.allocator.free(channel);
+        }
+        if (job.delivery.to_owned) {
+            if (job.delivery.to) |to| self.allocator.free(to);
+        }
     }
 
     pub fn deinit(self: *CronScheduler) void {
@@ -1129,6 +1137,31 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             break :blk false;
         };
 
+        // Load delivery config
+        const delivery_mode = blk: {
+            if (obj.get("delivery_mode")) |v| {
+                if (v == .string) {
+                    if (std.mem.eql(u8, v.string, "always")) break :blk DeliveryMode.always;
+                    if (std.mem.eql(u8, v.string, "on_success")) break :blk DeliveryMode.on_success;
+                    if (std.mem.eql(u8, v.string, "on_error")) break :blk DeliveryMode.on_error;
+                    if (std.mem.eql(u8, v.string, "none")) break :blk DeliveryMode.none;
+                }
+            }
+            break :blk DeliveryMode.none;
+        };
+        const delivery_channel = blk: {
+            if (obj.get("delivery_channel")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_to = blk: {
+            if (obj.get("delivery_to")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+
         try scheduler.jobs.append(scheduler.allocator, .{
             .id = try scheduler.allocator.dupe(u8, id),
             .expression = try scheduler.allocator.dupe(u8, expression),
@@ -1141,6 +1174,13 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
             .enabled = enabled,
             .delete_after_run = delete_after_run,
+            .delivery = .{
+                .mode = delivery_mode,
+                .channel = if (delivery_channel) |c| try scheduler.allocator.dupe(u8, c) else null,
+                .to = if (delivery_to) |t| try scheduler.allocator.dupe(u8, t) else null,
+                .channel_owned = delivery_channel != null,
+                .to_owned = delivery_to != null,
+            },
         });
     }
 }
@@ -1199,6 +1239,10 @@ const JsonCronJob = struct {
     last_status: ?[]const u8,
     paused: bool,
     one_shot: bool,
+    // Delivery config for notifications
+    delivery_mode: ?[]const u8 = null,
+    delivery_channel: ?[]const u8 = null,
+    delivery_to: ?[]const u8 = null,
 };
 
 /// Get the default cron.json path: ~/.nullclaw/cron.json
@@ -1285,6 +1329,25 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
         try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
+
+        // Delivery config for notifications
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_mode");
+        try json_util.appendJsonString(&buf, scheduler.allocator, job.delivery.mode.asStr());
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_channel");
+        if (job.delivery.channel) |channel| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, channel);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delivery_to");
+        if (job.delivery.to) |to| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, to);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
 
         try buf.appendSlice(scheduler.allocator, "}");
     }
@@ -1574,10 +1637,53 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
         log.info("Run history for job {s} ({s}):", .{ id, job.command });
         const status = job.last_status orelse "never run";
         log.info("  Last status: {s}", .{status});
-        log.info("  Next run:    {d}", .{job.next_run_secs});
+        var ts_buf: [64]u8 = undefined;
+        const formatted = formatUnixTimestamp(job.next_run_secs, &ts_buf);
+        log.info("  Next run:    {d} ({s})", .{ job.next_run_secs, formatted });
     } else {
         log.warn("Cron job '{s}' not found", .{id});
     }
+}
+
+/// Format a Unix timestamp (seconds since epoch) into a human-readable string.
+/// Returns: "Mon Mar 02 2026 12:39:00 UTC"
+fn formatUnixTimestamp(secs: i64, buf: []u8) []const u8 {
+    const min_formatted_len = "Thu Jan 01 1970 00:00:00 UTC".len;
+    if (buf.len < min_formatted_len) return "buffer too small";
+    if (secs < 0) return "invalid timestamp";
+
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+    const epoch_day = epoch_secs.getEpochDay();
+    const day_seconds = epoch_secs.getDaySeconds();
+
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    // Jan 1, 1970 was Thursday (day 0 = Thu, day 4 = Mon, etc.)
+    // Formula: (epoch_day.day + 4) % 7 gives us an index into the weekday array
+    const weekday_num = @as(u3, @intCast((epoch_day.day + 4) % 7));
+    const weekday_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const hour = day_seconds.getHoursIntoDay();
+    const minute = day_seconds.getMinutesIntoHour();
+    const second = day_seconds.getSecondsIntoMinute();
+
+    const month_num = month_day.month.numeric();
+    const month_index = if (month_num > 0 and month_num <= 12) month_num - 1 else 0;
+    const month_name = month_names[month_index];
+
+    const len = std.fmt.bufPrint(buf, "{s} {s} {d:0>2} {d} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
+        weekday_names[weekday_num],
+        month_name,
+        month_day.day_index + 1,
+        year_day.year,
+        hour,
+        minute,
+        second,
+    }) catch return "format error";
+
+    return buf[0..len.len];
 }
 
 // ── Backwards-compatible type alias ──────────────────────────────────
@@ -1600,6 +1706,40 @@ test "parseDuration days" {
 
 test "parseDuration weeks" {
     try std.testing.expectEqual(@as(i64, 604800), try parseDuration("1w"));
+}
+
+test "formatUnixTimestamp formats known UTC timestamp" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Mon Mar 02 2026 14:00:00 UTC",
+        formatUnixTimestamp(1772460000, &buf),
+    );
+}
+
+test "formatUnixTimestamp formats unix epoch" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Thu Jan 01 1970 00:00:00 UTC",
+        formatUnixTimestamp(0, &buf),
+    );
+}
+
+test "formatUnixTimestamp rejects negative timestamp" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("invalid timestamp", formatUnixTimestamp(-1, &buf));
+}
+
+test "formatUnixTimestamp accepts exact-size buffer" {
+    var buf: [28]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Thu Jan 01 1970 00:00:00 UTC",
+        formatUnixTimestamp(0, &buf),
+    );
+}
+
+test "formatUnixTimestamp rejects undersized buffer" {
+    var buf: [27]u8 = undefined;
+    try std.testing.expectEqualStrings("buffer too small", formatUnixTimestamp(0, &buf));
 }
 
 test "parseDuration seconds" {

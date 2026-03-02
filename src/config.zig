@@ -190,6 +190,15 @@ pub const Config = struct {
         return true;
     }
 
+    /// Look up the optional User-Agent for a provider.
+    /// Returns null if provider is not in the list or has no user_agent set.
+    pub fn getProviderUserAgent(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.user_agent;
+        }
+        return null;
+    }
+
     /// Sync flat convenience fields from the nested sub-configs.
     pub fn syncFlatFields(self: *Config) void {
         self.temperature = self.default_temperature;
@@ -575,18 +584,28 @@ pub const Config = struct {
                 try w.print("      \"{s}\": {{", .{entry.name});
                 var has_field = false;
                 if (entry.api_key) |key| {
-                    try w.print("\"api_key\": \"{s}\"", .{key});
+                    try w.print("\"api_key\": ", .{});
+                    try writePrettyJsonInline(self.allocator, w, key, "");
                     has_field = true;
                 }
                 if (entry.base_url) |base| {
                     if (has_field) try w.print(", ", .{});
-                    try w.print("\"base_url\": \"{s}\"", .{base});
+                    try w.print("\"base_url\": ", .{});
+                    try writePrettyJsonInline(self.allocator, w, base, "");
                     has_field = true;
                 }
                 if (comptime @hasField(ProviderEntry, "native_tools")) {
                     if (!entry.native_tools) {
                         if (has_field) try w.print(", ", .{});
                         try w.print("\"native_tools\": false", .{});
+                        has_field = true;
+                    }
+                }
+                if (comptime @hasField(ProviderEntry, "user_agent")) {
+                    if (entry.user_agent) |ua| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"user_agent\": ", .{});
+                        try writePrettyJsonInline(self.allocator, w, ua, "");
                         has_field = true;
                     }
                 }
@@ -701,6 +720,7 @@ pub const Config = struct {
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
+            .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
         }, .{})});
 
@@ -1498,6 +1518,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.compaction_keep_recent = 12;
     cfg.agent.compaction_max_summary_chars = 3000;
     cfg.agent.compaction_max_source_chars = 9000;
+    cfg.agent.status_show_emojis = false;
     cfg.agent.message_timeout_secs = 60;
 
     cfg.memory.search.provider = "openai";
@@ -1613,6 +1634,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expect(loaded.agent.parallel_tools);
+    try std.testing.expect(!loaded.agent.status_show_emojis);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
@@ -2212,7 +2234,7 @@ test "json parse scheduler section" {
 test "json parse agent section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2223,6 +2245,7 @@ test "json parse agent section" {
     try std.testing.expectEqualStrings("xml", cfg.agent.tool_dispatcher);
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
+    try std.testing.expect(!cfg.agent.status_show_emojis);
     allocator.free(cfg.agent.tool_dispatcher);
 }
 
@@ -2235,6 +2258,7 @@ test "json parse agent token_limit explicit remains false when omitted" {
     try cfg.parseJson(json);
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, cfg.agent.token_limit);
     try std.testing.expect(!cfg.agent.token_limit_explicit);
+    try std.testing.expect(cfg.agent.status_show_emojis);
 }
 
 test "json parse composio section" {
@@ -2869,6 +2893,7 @@ test "json parse providers section" {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.user_agent) |ua| allocator.free(ua);
     }
     allocator.free(cfg.providers);
 }
@@ -2895,6 +2920,7 @@ test "save writes provider native_tools when false" {
             .name = "groq",
             .api_key = "gsk_test",
             .native_tools = false,
+            .user_agent = "nullclaw-test/1.0",
         },
     };
 
@@ -2906,6 +2932,50 @@ test "save writes provider native_tools when false" {
     defer allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"native_tools\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"user_agent\": \"nullclaw-test/1.0\"") != null);
+}
+
+test "save escapes provider string fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "openai",
+            .api_key = "sk-\"quoted\"",
+            .base_url = "https://api.example.com/v1/\"quoted\"",
+            .user_agent = "nullclaw \"agent\"",
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const models = parsed.value.object.get("models").?.object;
+    const providers = models.get("providers").?.object;
+    const openai = providers.get("openai").?.object;
+
+    try std.testing.expectEqualStrings("sk-\"quoted\"", openai.get("api_key").?.string);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/\"quoted\"", openai.get("base_url").?.string);
+    try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
 }
 
 test "json parse tools.media.audio section" {
@@ -2973,6 +3043,7 @@ test "defaultProviderKey returns key for default provider" {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.user_agent) |ua| allocator.free(ua);
     }
     allocator.free(cfg.providers);
 }

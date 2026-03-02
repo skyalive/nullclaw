@@ -736,6 +736,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.agent.token_limit_explicit = true;
                 }
             }
+            if (ag.object.get("status_show_emojis")) |v| {
+                if (v == .bool) self.agent.status_show_emojis = v.bool;
+            }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
@@ -1590,6 +1593,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("native_tools")) |nt| {
                             if (nt == .bool) pe.native_tools = nt.bool;
                         }
+                        if (val.object.get("user_agent")) |ua| {
+                            if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);
@@ -1629,6 +1635,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             const typing_val = sess.object.get("typing_interval_secs");
             if (typing_val) |v| {
                 if (v == .integer) self.session.typing_interval_secs = @intCast(v.integer);
+            }
+            const concurrent_val = sess.object.get("max_concurrent_tasks");
+            if (concurrent_val) |v| {
+                if (v == .integer) self.session.max_concurrent_tasks = @intCast(v.integer);
             }
             const links_val = sess.object.get("identity_links");
             if (links_val) |links| {
