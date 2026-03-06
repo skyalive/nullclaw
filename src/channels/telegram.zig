@@ -2925,13 +2925,15 @@ fn shouldDebounceTextMessage(self: *const TelegramChannel, msg: root.ChannelMess
     // in practice many clients emit chunk sizes around ~3.3k-3.6k.
     if (msg.content.len >= TEXT_SPLIT_LIKELY_MIN_LEN) return true;
 
-    // If a chain is already pending for this sender/chat, debounce follow-ups too.
-    return pendingTextLatestSeenForKey(
+    // Only debounce follow-ups when they are part of a *recent* rapid-fire chain.
+    const latest = pendingTextLatestSeenForKey(
         msg.id,
         msg.sender,
         self.pending_text_messages.items,
         self.pending_text_received_at.items,
-    ) != null;
+    ) orelse return false;
+    const now = root.nowEpochSecs();
+    return now <= latest + TEXT_MESSAGE_DEBOUNCE_SECS;
 }
 
 fn mergeConsecutiveMessages(
@@ -4253,6 +4255,38 @@ test "telegram shouldDebounceTextMessage handles long chunk and active chain" {
     try ch.pending_text_received_at.append(alloc, now);
 
     try std.testing.expect(shouldDebounceTextMessage(&ch, short_msg));
+}
+
+test "telegram shouldDebounceTextMessage does not debounce stale pending chain follow-up" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+    defer {
+        ch.resetPendingTextBuffers();
+        ch.pending_text_messages.deinit(alloc);
+        ch.pending_text_received_at.deinit(alloc);
+    }
+
+    const now = root.nowEpochSecs();
+    const short_msg: root.ChannelMessage = .{
+        .id = "user-a",
+        .sender = "chat-a",
+        .content = "oi",
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 77,
+    };
+
+    try ch.pending_text_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "pending old"),
+        .channel = "telegram",
+        .timestamp = now - 60,
+        .message_id = 0,
+    });
+    try ch.pending_text_received_at.append(alloc, now - (TEXT_MESSAGE_DEBOUNCE_SECS + 5));
+
+    try std.testing.expect(!shouldDebounceTextMessage(&ch, short_msg));
 }
 
 test "telegram shouldDebounceTextMessage catches real-world ~3.4k split chunk" {
