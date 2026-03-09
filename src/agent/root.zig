@@ -5211,7 +5211,7 @@ test "Agent shell failure with normalized output does not poison next turn" {
 
         fn failingShellCommand() []const u8 {
             return if (comptime builtin.os.tag == .windows)
-                "powershell.exe -NoProfile -Command \"[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4); exit 1\""
+                "powershell.exe -NoProfile -Command \"[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4)\" & exit /b 1"
             else
                 "printf '\\200' >&2; exit 1";
         }
