@@ -2929,6 +2929,42 @@ test "parse agents.list with id field" {
     allocator.free(cfg.agents);
 }
 
+test "parse agents object-of-objects shape" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "agents": {
+        \\    "defaults": {"model": {"primary": "anthropic/claude-opus-4"}},
+        \\    "coder": {"provider": "openrouter", "model": "openai/gpt-4.1-mini", "temperature": 0.2},
+        \\    "researcher": {"provider": "anthropic", "model": {"primary": "claude-sonnet-4"}, "max_depth": 5}
+        \\  }
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
+    try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.agents.len);
+    try std.testing.expectEqualStrings("coder", cfg.agents[0].name);
+    try std.testing.expectEqualStrings("openrouter", cfg.agents[0].provider);
+    try std.testing.expectEqualStrings("openai/gpt-4.1-mini", cfg.agents[0].model);
+    try std.testing.expectEqual(@as(f64, 0.2), cfg.agents[0].temperature.?);
+    try std.testing.expectEqualStrings("researcher", cfg.agents[1].name);
+    try std.testing.expectEqualStrings("anthropic", cfg.agents[1].provider);
+    try std.testing.expectEqualStrings("claude-sonnet-4", cfg.agents[1].model);
+    try std.testing.expectEqual(@as(u32, 5), cfg.agents[1].max_depth);
+    allocator.free(cfg.default_provider);
+    allocator.free(cfg.default_model.?);
+    for (cfg.agents) |a| {
+        allocator.free(a.name);
+        allocator.free(a.provider);
+        allocator.free(a.model);
+        if (a.system_prompt) |sp| allocator.free(sp);
+        if (a.api_key) |k| allocator.free(k);
+    }
+    allocator.free(cfg.agents);
+}
+
 test "parse top-level bindings with snake_case fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
