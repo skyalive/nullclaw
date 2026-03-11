@@ -260,6 +260,19 @@ pub const TelegramInteractiveConfig = struct {
     remove_on_click: bool = true,
 };
 
+pub const TelegramReactionEmojisConfig = struct {
+    accepted: []const u8 = "👀",
+    running: []const u8 = "⚡",
+    done: []const u8 = "👍",
+    failed: []const u8 = "💔",
+};
+
+pub const TelegramCommandsMenuMode = enum {
+    off,
+    flat,
+    scoped,
+};
+
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
@@ -275,6 +288,17 @@ pub const TelegramConfig = struct {
     require_mention: bool = false,
     /// Stream partial responses to users via sendMessageDraft before the final message.
     streaming: bool = true,
+    /// Show task lifecycle on the triggering user message via Telegram reactions.
+    status_reactions: bool = false,
+    /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
+    reaction_emojis: TelegramReactionEmojisConfig = .{},
+    /// Enable Telegram-specific topic management commands such as /topic.
+    topic_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic/session map command such as /topics.
+    topic_map_command_enabled: bool = true,
+    /// Publish Telegram slash-command menu:
+    /// off = clear it, flat = one global list, scoped = separate private/group menus.
+    commands_menu_mode: TelegramCommandsMenuMode = .flat,
 };
 
 pub const DiscordConfig = struct {

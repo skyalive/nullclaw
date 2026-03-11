@@ -4110,6 +4110,8 @@ test "slash /help returns help text" {
     try std.testing.expect(std.mem.indexOf(u8, response, "/help") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "/status") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "/model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/tasks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/poll") != null);
 }
 
 test "slash /commands aliases to help" {

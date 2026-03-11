@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const yc = @import("nullclaw");
+const control_plane = yc.control_plane;
 
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = error_return_trace;
@@ -2079,6 +2080,124 @@ fn runMatrixChannel(
 
 // ── Telegram Channel ───────────────────────────────────────────────-
 
+fn sendStandaloneTelegramStartGreeting(
+    tg: *yc.channels.telegram.TelegramChannel,
+    sender: []const u8,
+    first_name: ?[]const u8,
+    fallback_name: []const u8,
+    model: []const u8,
+    reply_to_id: ?i64,
+) void {
+    var greeting_buf: [512]u8 = undefined;
+    const name = first_name orelse fallback_name;
+    const greeting = std.fmt.bufPrint(
+        &greeting_buf,
+        "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.",
+        .{ name, model },
+    ) catch "Hello! I'm nullClaw. Type /help for commands.";
+    tg.sendMessageWithReply(sender, greeting, reply_to_id) catch |err| {
+        log.err("failed to send /start reply: {}", .{err});
+    };
+}
+
+fn handleStandaloneTelegramBuiltinCommand(
+    allocator: std.mem.Allocator,
+    session_mgr: *yc.session.SessionManager,
+    tg: *yc.channels.telegram.TelegramChannel,
+    content: []const u8,
+    sender: []const u8,
+    sender_identity: []const u8,
+    first_name: ?[]const u8,
+    model: []const u8,
+    reply_to_id: ?i64,
+    message_id: ?i64,
+) bool {
+    const cmd = control_plane.parseSlashCommand(content) orelse return false;
+
+    if (control_plane.isSlashName(cmd, "start")) {
+        sendStandaloneTelegramStartGreeting(tg, sender, first_name, sender_identity, model, reply_to_id);
+        return true;
+    }
+
+    if (control_plane.isSlashName(cmd, "topics") or control_plane.isSlashName(cmd, "topic-map")) {
+        tg.setTaskReaction(sender, message_id, .accepted);
+
+        if (!tg.topic_map_command_enabled) {
+            tg.setTaskReaction(sender, message_id, .failed);
+            tg.sendMessageWithReply(sender, "Topic map command is disabled for this Telegram account.", reply_to_id) catch |err| {
+                log.err("failed to send /topics disabled reply: {}", .{err});
+            };
+            return true;
+        }
+
+        tg.setTaskReaction(sender, message_id, .running);
+        const report = yc.channel_loop.buildTelegramTopicMapReply(allocator, session_mgr, sender) catch |err| {
+            tg.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to build /topics reply: {}", .{err});
+            tg.sendMessageWithReply(sender, "Failed to build topic/session map.", reply_to_id) catch |send_err| {
+                log.err("failed to send /topics error reply: {}", .{send_err});
+            };
+            return true;
+        };
+        defer allocator.free(report);
+
+        tg.sendMessageWithReply(sender, report, reply_to_id) catch |err| {
+            tg.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to send /topics reply: {}", .{err});
+            return true;
+        };
+        tg.setTaskReaction(sender, message_id, .done);
+        return true;
+    }
+
+    if (!control_plane.isSlashName(cmd, "topic")) return false;
+
+    tg.setTaskReaction(sender, message_id, .accepted);
+
+    if (!tg.topic_commands_enabled) {
+        tg.setTaskReaction(sender, message_id, .failed);
+        tg.sendMessageWithReply(sender, "Topic commands are disabled for this Telegram account.", reply_to_id) catch |err| {
+            log.err("failed to send /topic disabled reply: {}", .{err});
+        };
+        return true;
+    }
+
+    const topic_name = std.mem.trim(u8, cmd.arg, " \t\r\n");
+    if (topic_name.len == 0) {
+        tg.setTaskReaction(sender, message_id, .failed);
+        tg.sendMessageWithReply(sender, "Usage: /topic <name>", reply_to_id) catch |err| {
+            log.err("failed to send /topic usage reply: {}", .{err});
+        };
+        return true;
+    }
+
+    tg.setTaskReaction(sender, message_id, .running);
+    const thread_id = tg.createForumTopicFromTarget(sender, topic_name) catch |err| {
+        tg.setTaskReaction(sender, message_id, .failed);
+        const err_msg: []const u8 = switch (err) {
+            error.InvalidTopicName => "Topic name must be 1-128 characters.",
+            else => "Failed to create topic. This works only in forum-enabled supergroups where the bot can manage topics.",
+        };
+        tg.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| {
+            log.err("failed to send /topic error reply: {}", .{send_err});
+        };
+        return true;
+    };
+
+    const confirmation = std.fmt.allocPrint(
+        allocator,
+        "Created topic \"{s}\" (thread {d}). Messages in that topic will use an isolated nullclaw session.",
+        .{ topic_name, thread_id },
+    ) catch null;
+    defer if (confirmation) |msg| allocator.free(msg);
+
+    tg.sendMessageWithReply(sender, confirmation orelse "Topic created.", reply_to_id) catch |err| {
+        log.err("failed to send /topic confirmation: {}", .{err});
+    };
+    tg.setTaskReaction(sender, message_id, .done);
+    return true;
+}
+
 fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, config: yc.config.Config, telegram_config: yc.config.TelegramConfig) !void {
     if (!build_options.enable_channel_telegram) {
         std.debug.print("Telegram channel is disabled in this build.\n", .{});
@@ -2141,7 +2260,15 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
     tg.proxy = telegram_config.proxy;
     tg.account_id = telegram_config.account_id;
+    tg.reply_in_private = telegram_config.reply_in_private;
     tg.interactive = telegram_config.interactive;
+    tg.require_mention = telegram_config.require_mention;
+    tg.streaming_enabled = telegram_config.streaming;
+    tg.status_reactions_enabled = telegram_config.status_reactions;
+    tg.reaction_emojis = telegram_config.reaction_emojis;
+    tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
+    tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
+    tg.commands_menu_mode = telegram_config.commands_menu_mode;
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
@@ -2254,7 +2381,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.deleteWebhookKeepPending();
 
     // Register bot commands in Telegram's "/" menu
-    tg.setMyCommands();
+    tg.syncCommandsMenu();
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
@@ -2279,51 +2406,53 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         for (messages) |msg| {
             std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
 
-            // Handle /start command (Telegram-specific greeting, not sent to LLM)
-            const trimmed_content = std.mem.trim(u8, msg.content, " \t\r\n");
-            if (std.mem.eql(u8, trimmed_content, "/start")) {
-                var greeting_buf: [512]u8 = undefined;
-                const name = msg.first_name orelse msg.id;
-                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullClaw. Type /help for commands.";
-                tg.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
-                continue;
-            }
-
             // Determine reply-to: always in groups, configurable in private chats
             const use_reply_to = msg.is_group or telegram_config.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
-            // Session key — resolve through route engine, fallback to legacy key.
-            var key_buf: [128]u8 = undefined;
-            var routed_session_key: ?[]const u8 = null;
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = blk: {
-                const route = yc.agent_routing.resolveRouteWithSession(
-                    allocator,
-                    .{
-                        .channel = "telegram",
-                        .account_id = tg.account_id,
-                        .peer = .{
-                            .kind = if (msg.is_group) .group else .direct,
-                            .id = msg.sender,
-                        },
-                    },
-                    config.agent_bindings,
-                    config.agents,
-                    config.session,
-                ) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}:{s}", .{ tg.account_id, msg.sender }) catch msg.sender;
-                allocator.free(route.main_session_key);
-                routed_session_key = route.session_key;
-                break :blk route.session_key;
+            if (handleStandaloneTelegramBuiltinCommand(
+                allocator,
+                &session_mgr,
+                &tg,
+                msg.content,
+                msg.sender,
+                msg.id,
+                msg.first_name,
+                model,
+                reply_to_id,
+                msg.message_id,
+            )) {
+                continue;
+            }
+
+            tg.setTaskReaction(msg.sender, msg.message_id, .accepted);
+
+            const session_key = yc.channel_loop.resolveTelegramSessionKey(
+                allocator,
+                &session_mgr,
+                &config,
+                tg.account_id,
+                msg.sender,
+                msg.is_group,
+            ) catch |err| {
+                tg.setTaskReaction(msg.sender, msg.message_id, .failed);
+                log.err("failed to resolve telegram session key: {}", .{err});
+                tg.sendMessageWithReply(msg.sender, "Failed to resolve session for this Telegram topic.", reply_to_id) catch |send_err| {
+                    log.err("failed to send telegram session-key error reply: {}", .{send_err});
+                };
+                continue;
             };
+            defer allocator.free(session_key);
 
             // Start periodic typing indicator while the model is processing
             const typing_target = msg.sender;
             tg.startTyping(typing_target) catch {};
             defer tg.stopTyping(typing_target) catch {};
 
+            tg.setTaskReaction(msg.sender, msg.message_id, .running);
             const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
+                tg.setTaskReaction(msg.sender, msg.message_id, .failed);
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
@@ -2341,8 +2470,11 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
             // Reply on telegram; handles [IMAGE:path] markers + split
             tg.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
+                tg.setTaskReaction(msg.sender, msg.message_id, .failed);
                 std.debug.print("  Send error: {}\n", .{err});
+                continue;
             };
+            tg.setTaskReaction(msg.sender, msg.message_id, .done);
         }
 
         if (messages.len > 0) {
