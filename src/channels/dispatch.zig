@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
+const log = std.log.scoped(.dispatch);
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
@@ -175,7 +176,8 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch {
+            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch |err| {
+                log.warn("outbound send failed: channel={s} chat={s} err={}", .{ msg.channel, msg.chat_id, err });
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };

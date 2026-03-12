@@ -100,13 +100,37 @@ fn openWorkspaceFileWithGuards(
     };
 }
 
-/// Conversation context for the current turn (Signal-specific for now).
+/// Conversation context for the current turn.
+/// Carries per-message sender metadata so the LLM always knows who is talking.
 pub const ConversationContext = struct {
     channel: ?[]const u8 = null,
+    // Signal
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
+    // Discord
+    sender_id: ?[]const u8 = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
+    // Shared
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
+
+    /// Compute a hash fingerprint of sender-identifying fields so the system
+    /// prompt can be rebuilt when the *sender* changes, not just when context
+    /// goes from null ↔ non-null.
+    pub fn senderFingerprint(self: ConversationContext) u64 {
+        var h = std.hash.Wyhash.init(0x1234_5678);
+        // Hash each sender-identifying field (or a sentinel null byte).
+        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_username, self.sender_display_name }) |field| {
+            if (field) |v| {
+                h.update(v);
+            } else {
+                h.update(&.{0});
+            }
+            h.update(&.{0xff}); // field separator
+        }
+        return h.final();
+    }
 };
 
 /// Context passed to prompt sections during construction.
@@ -220,6 +244,16 @@ pub fn buildSystemPrompt(
         }
         if (cc.sender_uuid) |uuid| {
             try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        }
+        // Discord sender fields
+        if (cc.sender_id) |sid| {
+            try std.fmt.format(w, "- Sender Discord ID: {s}\n", .{sid});
+        }
+        if (cc.sender_username) |uname| {
+            try std.fmt.format(w, "- Sender username: {s}\n", .{uname});
+        }
+        if (cc.sender_display_name) |dname| {
+            try std.fmt.format(w, "- Sender display name: {s}\n", .{dname});
         }
         try w.writeAll("\n");
     }
