@@ -19,6 +19,7 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
@@ -694,7 +695,39 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
 }
 
 fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
+    return std.mem.eql(u8, channel, "web") or
+        std.mem.eql(u8, channel, "telegram") or
+        std.mem.eql(u8, channel, "dingtalk");
+}
+
+fn makeAssistantReplyOutbound(
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    reply: []const u8,
+) !bus_mod.OutboundMessage {
+    if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
+        return if (account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, reply)
+        else
+            bus_mod.makeOutbound(allocator, channel, chat_id, reply);
+    }
+
+    var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
+    defer parsed.deinit(allocator);
+
+    if (parsed.choices) |choices| {
+        return if (account_id) |aid|
+            bus_mod.makeOutboundWithAccountChoices(allocator, channel, aid, chat_id, parsed.visible_text, choices.options)
+        else
+            bus_mod.makeOutboundWithChoices(allocator, channel, chat_id, parsed.visible_text, choices.options);
+    }
+
+    return if (account_id) |aid|
+        bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, parsed.visible_text)
+    else
+        bus_mod.makeOutbound(allocator, channel, chat_id, parsed.visible_text);
 }
 
 fn makeStreamingSinkForChannel(
@@ -793,10 +826,13 @@ fn inboundDispatcherThread(
         };
         defer allocator.free(reply);
 
-        const out = (if (outbound_account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)
-        else
-            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply)) catch |err| {
+        const out = makeAssistantReplyOutbound(
+            allocator,
+            msg.channel,
+            outbound_account_id,
+            msg.chat_id,
+            reply,
+        ) catch |err| {
             log.err("inbound dispatch makeOutbound failed: {}", .{err});
             continue;
         };
@@ -1075,6 +1111,19 @@ test "makeStreamingSinkForChannel returns null for unsupported channel" {
         .ctx = undefined,
     }, &filter);
     try std.testing.expect(sink == null);
+}
+
+test "makeStreamingSinkForChannel enables dingtalk" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("dingtalk", .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter);
+    try std.testing.expect(sink != null);
 }
 
 test "hasSupervisedChannels false for defaults" {
@@ -1834,6 +1883,32 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
     try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "makeAssistantReplyOutbound preserves plain replies without choices" {
+    const allocator = std.testing.allocator;
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", null, "chat1", "hello");
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("hello", msg.content);
+    try std.testing.expectEqual(@as(usize, 0), msg.choices.len);
+    try std.testing.expect(msg.account_id == null);
+}
+
+test "makeAssistantReplyOutbound extracts structured choices from assistant reply" {
+    const allocator = std.testing.allocator;
+    const reply =
+        \\Choose one:
+        \\<nc_choices>{"v":1,"options":[{"id":"yes","label":"Yes","submit_text":"yes"},{"id":"no","label":"No"}]}</nc_choices>
+    ;
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", "backup", "chat1", reply);
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("backup", msg.account_id.?);
+    try std.testing.expectEqualStrings("Choose one:\n", msg.content);
+    try std.testing.expectEqual(@as(usize, 2), msg.choices.len);
+    try std.testing.expectEqualStrings("yes", msg.choices[0].id);
+    try std.testing.expectEqualStrings("No", msg.choices[1].label);
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
