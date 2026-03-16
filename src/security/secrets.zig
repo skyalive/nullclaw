@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const log = std.log.scoped(.secrets);
@@ -222,7 +223,7 @@ pub const SecretStore = struct {
 
             // Ensure parent dir exists
             if (std.fs.path.dirname(path)) |parent| {
-                std.fs.cwd().makePath(parent) catch |err| {
+                fs_compat.makePath(parent) catch |err| {
                     log.err("failed to create parent dir {s}: {}", .{ parent, err });
                 };
             }
