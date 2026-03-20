@@ -203,7 +203,7 @@ pub const McpServer = struct {
                 allocator.free(resp.body);
                 return error.HttpBadStatus;
             }
-            return resp.body;
+            return try allocator.dupe(u8, extractJsonFromSse(resp.body));
         }
 
         const stdin = self.child.?.stdin orelse return error.NoStdin;
@@ -261,6 +261,10 @@ pub const McpServer = struct {
         var header_count: usize = 0;
 
         headers_buf[header_count] = .{ .name = "Content-Type", .value = "application/json" };
+        header_count += 1;
+
+        if (header_count >= headers_buf.len) return error.TooManyHeaders;
+        headers_buf[header_count] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
         header_count += 1;
 
         if (self.mcp_session_id) |sid| {
@@ -562,6 +566,27 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
     return all_tools.toOwnedSlice(allocator);
 }
 
+/// Extract JSON-RPC body from an SSE-formatted MCP HTTP response.
+/// Many MCP servers (playwright-mcp, firecrawl-mcp, mattermost-mcp) return
+/// responses in SSE format: "event: message\ndata: {json}\n".
+/// If the body is plain JSON, return it unchanged.
+pub fn extractJsonFromSse(body: []const u8) []const u8 {
+    // Fast path: already valid JSON
+    if (body.len > 0 and (body[0] == '{' or body[0] == '[')) return body;
+
+    // Look for "data:" prefix in SSE format
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (std.mem.startsWith(u8, trimmed, "data: ")) {
+            return trimmed["data: ".len..];
+        }
+    }
+
+    // Not SSE, return as-is
+    return body;
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 test "McpServer init fields" {
@@ -767,4 +792,53 @@ test "extractMcpSessionIdFromHeaders parses LF headers" {
     const hdr = "HTTP/1.1 200 OK\nMCP-Session-Id: zzz\nX: y\n";
     const got = McpServer.extractMcpSessionIdFromHeaders(hdr) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("zzz", got);
+}
+
+test "extractJsonFromSse passes through plain JSON" {
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    try std.testing.expectEqualStrings(json, extractJsonFromSse(json));
+}
+
+test "extractJsonFromSse extracts data from SSE format" {
+    const sse =
+        \\event: message
+        \\data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}
+        \\
+    ;
+    const expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}";
+    try std.testing.expectEqualStrings(expected, extractJsonFromSse(sse));
+}
+
+test "extractJsonFromSse handles SSE with CRLF line endings" {
+    const sse = "event: message\r\ndata: {\"ok\":true}\r\n";
+    try std.testing.expectEqualStrings("{\"ok\":true}", extractJsonFromSse(sse));
+}
+
+test "extractJsonFromSse handles SSE with multiple data lines" {
+    const sse =
+        \\event: message
+        \\data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}
+        \\
+    ;
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}", extractJsonFromSse(sse));
+}
+
+test "extractJsonFromSse returns original for empty body" {
+    try std.testing.expectEqualStrings("", extractJsonFromSse(""));
+}
+
+test "extractJsonFromSse returns original for non-SSE non-JSON body" {
+    const body = "some random text that is neither JSON nor SSE";
+    try std.testing.expectEqualStrings(body, extractJsonFromSse(body));
+}
+
+test "extractJsonFromSse handles SSE with id field (firecrawl format)" {
+    const sse =
+        \\event: message
+        \\id: abc-123_def
+        \\data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}
+        \\
+    ;
+    const expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}";
+    try std.testing.expectEqualStrings(expected, extractJsonFromSse(sse));
 }
