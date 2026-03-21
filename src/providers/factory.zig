@@ -50,8 +50,8 @@ const CompatProvider = struct {
     /// When set, cap max_tokens in non-streaming requests to this value.
     /// Fireworks rejects max_tokens > 4096 when stream=false.
     max_tokens_non_streaming: ?u32 = null,
-    /// When true, include `"thinking":{"type":"enabled"}` in request bodies
-    /// when reasoning_effort is set. Required by Z.AI/GLM thinking models.
+    /// When true, include `"thinking":{"type":"enabled|disabled"}` in request
+    /// bodies so Z.AI/GLM models do not fall back to server-side defaults.
     thinking_param: bool = false,
     /// When true, include `"enable_thinking":true` in request bodies
     /// when reasoning_effort is set. Required by Qwen (DashScope compatible mode).
@@ -59,6 +59,8 @@ const CompatProvider = struct {
     /// When true, include `"reasoning_split":true` in request bodies
     /// when reasoning_effort is set. Used by MiniMax to separate reasoning output.
     reasoning_split_param: bool = false,
+    /// When true, disable streaming so native tool_calls work correctly.
+    disable_streaming: bool = false,
 };
 
 const compat_providers = [_]CompatProvider{
@@ -95,10 +97,10 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — general ─────────────────────────────────────────
     .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
-    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
     .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
@@ -114,11 +116,11 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — CN endpoints ────────────────────────────────────
     .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
-    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
     .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
 
@@ -127,10 +129,10 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
-    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
-    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
     .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
@@ -399,6 +401,7 @@ pub const ProviderHolder = union(enum) {
                     if (c.thinking_param) prov.thinking_param = true;
                     if (c.enable_thinking_param) prov.enable_thinking_param = true;
                     if (c.reasoning_split_param) prov.reasoning_split_param = true;
+                    if (c.disable_streaming) prov.disable_streaming = true;
                 }
 
                 // Apply config-level overrides.
@@ -648,7 +651,10 @@ test "findCompatProvider returns correct flags" {
         "z.ai-global",
     };
     for (native_tool_aliases) |provider_name| {
-        try std.testing.expect(findCompatProvider(provider_name).?.native_tools);
+        const provider = findCompatProvider(provider_name).?;
+        try std.testing.expect(provider.native_tools);
+        try std.testing.expect(provider.disable_streaming);
+        try std.testing.expect(provider.thinking_param);
     }
 
     // MiniMax has both flags
@@ -700,6 +706,33 @@ test "fromConfig keeps native_tools enabled for z.ai/glm aliases" {
         defer holder.deinit();
         try std.testing.expect(holder == .compatible);
         try std.testing.expect(holder.compatible.native_tools);
+    }
+}
+
+test "fromConfig disables streaming for z.ai/glm aliases" {
+    const alloc = std.testing.allocator;
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+
+    for (native_tool_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, true, null, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(holder.compatible.disable_streaming);
+        try std.testing.expect(!holder.provider().supportsStreaming());
     }
 }
 
