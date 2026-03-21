@@ -10,6 +10,7 @@ const json_util = @import("json_util.zig");
 const version = @import("version.zig");
 const platform = @import("platform.zig");
 const http_util = @import("http_util.zig");
+const sse_client = @import("sse_client.zig");
 const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
@@ -203,7 +204,7 @@ pub const McpServer = struct {
                 allocator.free(resp.body);
                 return error.HttpBadStatus;
             }
-            return try allocator.dupe(u8, extractJsonFromSse(resp.body));
+            return try extractJsonFromSse(allocator, resp.body);
         }
 
         const stdin = self.child.?.stdin orelse return error.NoStdin;
@@ -570,21 +571,33 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
 /// Many MCP servers (playwright-mcp, firecrawl-mcp, mattermost-mcp) return
 /// responses in SSE format: "event: message\ndata: {json}\n".
 /// If the body is plain JSON, return it unchanged.
-pub fn extractJsonFromSse(body: []const u8) []const u8 {
-    // Fast path: already valid JSON
-    if (body.len > 0 and (body[0] == '{' or body[0] == '[')) return body;
+fn extractJsonFromSse(allocator: Allocator, body: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return try allocator.dupe(u8, body);
 
-    // Look for "data:" prefix in SSE format
-    var it = std.mem.splitScalar(u8, body, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (std.mem.startsWith(u8, trimmed, "data: ")) {
-            return trimmed["data: ".len..];
+    // Fast path: already valid JSON.
+    if (trimmed[0] == '{' or trimmed[0] == '[') {
+        return try allocator.dupe(u8, trimmed);
+    }
+
+    const events = try sse_client.parseEvents(allocator, body);
+    defer {
+        for (events) |*event| event.deinit(allocator);
+        allocator.free(events);
+    }
+
+    var first_payload: ?[]const u8 = null;
+    for (events) |event| {
+        const data = std.mem.trim(u8, event.data, " \t\r\n");
+        if (data.len == 0) continue;
+        if (first_payload == null) first_payload = data;
+        if (data[0] == '{' or data[0] == '[') {
+            return try allocator.dupe(u8, data);
         }
     }
 
-    // Not SSE, return as-is
-    return body;
+    // Not SSE, or SSE payload is not JSON-RPC; return the most useful fallback.
+    return try allocator.dupe(u8, first_payload orelse body);
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -796,7 +809,9 @@ test "extractMcpSessionIdFromHeaders parses LF headers" {
 
 test "extractJsonFromSse passes through plain JSON" {
     const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
-    try std.testing.expectEqualStrings(json, extractJsonFromSse(json));
+    const got = try extractJsonFromSse(std.testing.allocator, json);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(json, got);
 }
 
 test "extractJsonFromSse extracts data from SSE format" {
@@ -806,30 +821,53 @@ test "extractJsonFromSse extracts data from SSE format" {
         \\
     ;
     const expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}";
-    try std.testing.expectEqualStrings(expected, extractJsonFromSse(sse));
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(expected, got);
 }
 
 test "extractJsonFromSse handles SSE with CRLF line endings" {
     const sse = "event: message\r\ndata: {\"ok\":true}\r\n";
-    try std.testing.expectEqualStrings("{\"ok\":true}", extractJsonFromSse(sse));
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("{\"ok\":true}", got);
+}
+
+test "extractJsonFromSse handles data prefix without optional space" {
+    const sse =
+        \\event: message
+        \\data:{"ok":true}
+        \\
+    ;
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("{\"ok\":true}", got);
 }
 
 test "extractJsonFromSse handles SSE with multiple data lines" {
     const sse =
         \\event: message
-        \\data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}
+        \\data: {"jsonrpc":"2.0",
+        \\data: "id":2,"result":{"tools":[]}}
         \\
     ;
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}", extractJsonFromSse(sse));
+    const expected = "{\"jsonrpc\":\"2.0\",\n\"id\":2,\"result\":{\"tools\":[]}}";
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(expected, got);
 }
 
 test "extractJsonFromSse returns original for empty body" {
-    try std.testing.expectEqualStrings("", extractJsonFromSse(""));
+    const got = try extractJsonFromSse(std.testing.allocator, "");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("", got);
 }
 
 test "extractJsonFromSse returns original for non-SSE non-JSON body" {
     const body = "some random text that is neither JSON nor SSE";
-    try std.testing.expectEqualStrings(body, extractJsonFromSse(body));
+    const got = try extractJsonFromSse(std.testing.allocator, body);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(body, got);
 }
 
 test "extractJsonFromSse handles SSE with id field (firecrawl format)" {
@@ -840,5 +878,7 @@ test "extractJsonFromSse handles SSE with id field (firecrawl format)" {
         \\
     ;
     const expected = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\"}}";
-    try std.testing.expectEqualStrings(expected, extractJsonFromSse(sse));
+    const got = try extractJsonFromSse(std.testing.allocator, sse);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(expected, got);
 }
