@@ -123,7 +123,9 @@ pub const ShellTool = struct {
     /// against workspace + allowed_paths before passing to child processes.
     path_env_vars: []const []const u8 = &.{},
     sandbox: ?Sandbox = null,
-
+    // Storage for sandbox backends; must outlive the ShellTool.
+    // This is part of the vtable ownership pattern: the tool creator owns the storage.
+    sandbox_storage: SandboxStorage = .{},
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
     pub const tool_params =
@@ -915,6 +917,7 @@ test "shell with sandbox enabled wraps command" {
     var st = ShellTool{
         .workspace_dir = "/tmp",
         .sandbox = sandbox,
+        .sandbox_storage = storage,
     };
     const t = st.tool();
 

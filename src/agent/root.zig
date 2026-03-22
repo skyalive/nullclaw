@@ -27,6 +27,8 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const verbose_mod = @import("../verbose.zig");
+const telemetry = @import("../telemetry/message_log.zig");
+const ToolCall = providers.ToolCall;
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -316,6 +318,8 @@ pub const Agent = struct {
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
     log_llm_io: bool = false,
+    save_messages: bool = false,
+    message_logger: ?telemetry.MessageLogger = null,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
@@ -383,11 +387,50 @@ pub const Agent = struct {
 
     /// Append a history message that owns its content.
     /// On append failure, the message is deinitialized to avoid leaks.
-    fn appendOwnedHistoryMessage(self: *Agent, msg: OwnedMessage) !void {
+    fn appendOwnedHistoryMessage(
+        self: *Agent,
+        msg: OwnedMessage,
+        tool_calls: []const ParsedToolCall,
+        display_text: ?[]const u8,
+    ) !void {
         self.history.append(self.allocator, msg) catch |err| {
             msg.deinit(self.allocator);
             return err;
         };
+
+        // Log to file if message logging is enabled and message is user or assistant
+        if (self.message_logger) |*logger| {
+            if (msg.role == .user or msg.role == .assistant) {
+                // Use display_text if provided, else content. For assistant with tool calls,
+                // display_text should be the clean user-facing text (without tool blocks).
+                const body = if (display_text != null) display_text.? else msg.content;
+
+                if (tool_calls.len > 0) {
+                    var logs = try self.allocator.alloc(telemetry.MessageLogger.ToolCallLog, tool_calls.len);
+                    errdefer self.allocator.free(logs);
+                    for (tool_calls, 0..) |call, i| {
+                        logs[i] = .{
+                            .name = call.name,
+                            .arguments_json = call.arguments_json,
+                        };
+                    }
+                    logger.logMessage(
+                        @tagName(msg.role),
+                        body,
+                        self.memory_session_id,
+                        logs,
+                    );
+                    self.allocator.free(logs);
+                } else {
+                    logger.logMessage(
+                        @tagName(msg.role),
+                        body,
+                        self.memory_session_id,
+                        null,
+                    );
+                }
+            }
+        }
     }
 
     /// Initialize agent from a loaded Config.
@@ -462,6 +505,17 @@ pub const Agent = struct {
             effective_workspace_dir,
         ) catch null;
 
+        // Initialize message logger if save_messages is enabled
+        var message_logger: ?telemetry.MessageLogger = null;
+        if (cfg.save_messages) {
+            const init_result = telemetry.MessageLogger.init(allocator, effective_workspace_dir, true);
+            message_logger = if (init_result) |logger| logger else |err| blk: {
+                // Log failure but continue without message logging
+                std.debug.print("MessageLogger.init failed: {s}\n", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
@@ -498,6 +552,8 @@ pub const Agent = struct {
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
             .log_llm_io = cfg.diagnostics.log_llm_io,
+            .save_messages = cfg.save_messages,
+            .message_logger = message_logger,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
@@ -545,6 +601,9 @@ pub const Agent = struct {
         }
         self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+        if (self.message_logger) |*logger| {
+            logger.deinit();
+        }
     }
 
     pub fn requestInterrupt(self: *Agent) void {
@@ -618,10 +677,10 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
         errdefer self.allocator.free(msg);
-        try self.history.append(self.allocator, .{
+        try self.appendOwnedHistoryMessage(.{
             .role = .assistant,
             .content = try self.allocator.dupe(u8, msg),
-        });
+        }, &[_]ParsedToolCall{}, null);
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         return msg;
@@ -1748,7 +1807,7 @@ pub const Agent = struct {
             try self.allocator.dupe(u8, effective_user_message);
 
         // Keep the user message retained even if provider/tool steps fail.
-        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched }, &[_]ParsedToolCall{}, null);
 
         // ── Response cache check ──
         if (self.response_cache) |rc| {
@@ -1762,10 +1821,10 @@ pub const Agent = struct {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
                 errdefer self.allocator.free(history_copy);
-                try self.history.append(self.allocator, .{
+                try self.appendOwnedHistoryMessage(.{
                     .role = .assistant,
                     .content = history_copy,
-                });
+                }, &[_]ParsedToolCall{}, null);
                 self.last_turn_usage = .{};
                 return cached_response;
             }
@@ -2152,7 +2211,7 @@ pub const Agent = struct {
                     if (empty_response_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") }, &[_]ParsedToolCall{}, null);
                         self.trimHistory();
                         empty_response_retry_count += 1;
                         continue;
@@ -2169,10 +2228,10 @@ pub const Agent = struct {
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
-                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) });
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) }, &[_]ParsedToolCall{}, null);
                     try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
                         "Do it in this turn by issuing the appropriate tool call(s). " ++
-                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
+                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") }, &[_]ParsedToolCall{}, null);
                     self.trimHistory();
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -2190,10 +2249,10 @@ pub const Agent = struct {
                 errdefer self.allocator.free(final_text);
 
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
-                try self.history.append(self.allocator, .{
+                try self.appendOwnedHistoryMessage(.{
                     .role = .assistant,
                     .content = try self.allocator.dupe(u8, display_text),
-                });
+                }, &[_]ParsedToolCall{}, null);
 
                 // Auto-compaction before hard trimming to preserve context
                 self.last_turn_compacted = self.autoCompactHistory() catch false;
@@ -2271,7 +2330,13 @@ pub const Agent = struct {
             } else try self.allocator.dupe(u8, assistant_history_content);
 
             // Once appended, history owns the buffer.
-            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = assistant_content });
+            // Use parsed_calls (which includes XML-parsed tool calls), not response.tool_calls (native only).
+            // Pass display_text for clean logging body (tool calls go in frontmatter only).
+            try self.appendOwnedHistoryMessage(
+                .{ .role = .assistant, .content = assistant_content },
+                parsed_calls,
+                if (parsed_calls.len > 0) display_text else null,
+            );
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -2366,10 +2431,10 @@ pub const Agent = struct {
                     "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
                 .{scrubbed_results},
             );
-            try self.history.append(self.allocator, .{
+            try self.appendOwnedHistoryMessage(.{
                 .role = .user,
                 .content = try self.allocator.dupe(u8, with_reflection),
-            });
+            }, &[_]ParsedToolCall{}, null);
 
             self.trimHistory();
 
@@ -2385,12 +2450,12 @@ pub const Agent = struct {
         log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
 
         // Append a pseudo-user message forcing a text-only summary
-        try self.history.append(self.allocator, .{
+        try self.appendOwnedHistoryMessage(.{
             .role = .user,
             .content = try self.allocator.dupe(u8, "SYSTEM: You have reached the maximum number of tool iterations. " ++
                 "You MUST NOT call any more tools. Summarize what you have accomplished " ++
                 "so far and what remains to be done. Respond in the same language the user used."),
-        });
+        }, &[_]ParsedToolCall{}, null);
 
         // Build messages for the summary call
         const summary_messages = self.buildMessageSlice() catch {
@@ -2459,10 +2524,10 @@ pub const Agent = struct {
         errdefer self.allocator.free(prefixed);
 
         // Store in history (dupe the raw summary, not the prefixed version)
-        try self.history.append(self.allocator, .{
+        try self.appendOwnedHistoryMessage(.{
             .role = .assistant,
             .content = try self.allocator.dupe(u8, summary_text),
-        });
+        }, &[_]ParsedToolCall{}, null);
 
         // Compact/trim history so the next turn doesn't start with bloated context
         self.last_turn_compacted = self.autoCompactHistory() catch false;
