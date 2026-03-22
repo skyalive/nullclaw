@@ -28,6 +28,7 @@ const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const verbose_mod = @import("../verbose.zig");
 const telemetry = @import("../telemetry/message_log.zig");
+const fs_compat = @import("../fs_compat.zig");
 const ToolCall = providers.ToolCall;
 
 const cache = memory_mod.cache;
@@ -320,6 +321,8 @@ pub const Agent = struct {
     log_llm_io: bool = false,
     save_messages: bool = false,
     message_logger: ?telemetry.MessageLogger = null,
+    warm_start: bool = false,
+    warm_start_max_messages: u32 = 30,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
@@ -554,6 +557,8 @@ pub const Agent = struct {
             .log_llm_io = cfg.diagnostics.log_llm_io,
             .save_messages = cfg.save_messages,
             .message_logger = message_logger,
+            .warm_start = cfg.agent.warm_start,
+            .warm_start_max_messages = cfg.agent.warm_start_max_messages,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
@@ -603,6 +608,247 @@ pub const Agent = struct {
         self.allocator.free(self.tool_specs);
         if (self.message_logger) |*logger| {
             logger.deinit();
+        }
+    }
+
+    /// Parse a message log file (YAML frontmatter + content).
+    /// Returns role, optional session_id, and content (slice into data).
+    fn parseMessageFile(self: *Agent, data: []const u8) !struct {
+        role: providers.Role,
+        session_id: ?[]const u8,
+        content: []const u8,
+    } {
+        _ = self; // unused
+        var pos: usize = 0;
+        var line_start: usize = 0;
+        var state: enum { before_frontmatter, in_frontmatter, after_frontmatter } = .before_frontmatter;
+        var role_str: ?[]const u8 = null;
+        var session_id_slice: ?[]const u8 = null;
+        var content_start: usize = 0;
+
+        while (pos < data.len) {
+            if (data[pos] == '\n') {
+                const line = data[line_start..pos]; // exclude newline
+                pos += 1;
+                line_start = pos;
+
+                // Trim trailing '\r' if present (Windows line endings)
+                const line_clean = if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
+
+                if (state == .before_frontmatter) {
+                    if (std.mem.eql(u8, line_clean, "---")) {
+                        state = .in_frontmatter;
+                    } else {
+                        return error.NoFrontmatter;
+                    }
+                } else if (state == .in_frontmatter) {
+                    if (std.mem.eql(u8, line_clean, "---")) {
+                        state = .after_frontmatter;
+                        content_start = line_start;
+                        break;
+                    } else {
+                        // Parse "key: value"
+                        if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
+                            const key = std.mem.trim(u8, line[0..colon_idx], " \t\r");
+                            const raw_val = std.mem.trim(u8, line[colon_idx + 1 ..], " \t\r");
+                            if (std.mem.eql(u8, key, "role")) {
+                                if (raw_val.len >= 2 and raw_val[0] == '"' and raw_val[raw_val.len - 1] == '"') {
+                                    role_str = raw_val[1 .. raw_val.len - 1];
+                                } else {
+                                    return error.InvalidRoleFormat;
+                                }
+                            } else if (std.mem.eql(u8, key, "session_id")) {
+                                if (std.mem.eql(u8, raw_val, "null")) {
+                                    session_id_slice = null;
+                                } else if (raw_val.len >= 2 and raw_val[0] == '"' and raw_val[raw_val.len - 1] == '"') {
+                                    session_id_slice = raw_val[1 .. raw_val.len - 1];
+                                } else {
+                                    return error.InvalidSessionIdFormat;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                pos += 1;
+            }
+        }
+
+        if (state != .after_frontmatter) return error.NoClosingDelimiter;
+        if (role_str == null) return error.MissingRole;
+
+        const role = providers.Role.fromSlice(role_str.?) orelse return error.UnknownRole;
+
+        return .{
+            .role = role,
+            .session_id = session_id_slice,
+            .content = data[content_start..],
+        };
+    }
+
+    /// Warm start: Rebuild conversation history from saved message logs.
+    pub fn attemptWarmStart(self: *Agent) void {
+        // Guard: skip if history already exists or workspace_dir is empty
+        if (self.history.items.len > 0 or self.workspace_dir.len == 0) return;
+
+        // Build messages directory path
+        const messages_dir = std.fs.path.join(self.allocator, &.{ self.workspace_dir, "messages" }) catch |err| {
+            log.warn("Warm start: failed to construct messages directory path: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(messages_dir);
+
+        // Verify messages_dir exists and is accessible
+        std.fs.accessAbsolute(messages_dir, .{}) catch |err| {
+            if (err == error.FileNotFound or err == error.NotDir) {
+                // No messages directory; nothing to warm start
+                return;
+            }
+            log.warn("Warm start: cannot access messages directory '{s}': {s}", .{messages_dir, @errorName(err)});
+            return;
+        };
+
+        // Recursively collect all .md files
+        var files = std.ArrayList([]const u8).empty;
+        defer files.deinit(self.allocator);
+
+        var dirs_to_visit = std.ArrayList([]const u8).empty;
+        defer dirs_to_visit.deinit(self.allocator);
+        dirs_to_visit.append(self.allocator, messages_dir) catch |err| {
+            log.warn("Warm start: failed to allocate initial dir: {s}", .{@errorName(err)});
+            return;
+        };
+
+        while (dirs_to_visit.items.len > 0) {
+            const current_dir = dirs_to_visit.pop().?;
+            var dir = std.fs.openDirAbsolute(current_dir, .{ .iterate = true }) catch |err| {
+                log.warn("Warm start: failed to open directory '{s}': {s}", .{current_dir, @errorName(err)});
+                self.allocator.free(current_dir);
+                continue;
+            };
+            defer dir.close();
+
+            var iter = dir.iterate();
+            while (true) {
+                const entry = iter.next() catch |err| {
+                    log.warn("Warm start: directory iteration error in '{s}': {s}", .{current_dir, @errorName(err)});
+                    continue;
+                } orelse break;
+                // Skip special entries
+                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+
+                if (entry.kind == .file) {
+                    if (std.mem.endsWith(u8, entry.name, ".md")) {
+                        const full_path = std.fs.path.join(self.allocator, &.{ current_dir, entry.name }) catch |err| {
+                            log.warn("Warm start: failed to allocate file path: {s}", .{@errorName(err)});
+                            continue;
+                        };
+                        files.append(self.allocator, full_path) catch |err| {
+                            self.allocator.free(full_path);
+                            log.warn("Warm start: failed to append file path: {s}", .{@errorName(err)});
+                        };
+                    }
+                } else if (entry.kind == .directory) {
+                    const subdir_path = std.fs.path.join(self.allocator, &.{ current_dir, entry.name }) catch |err| {
+                        log.warn("Warm start: failed to allocate subdir path: {s}", .{@errorName(err)});
+                        continue;
+                    };
+                    dirs_to_visit.append(self.allocator, subdir_path) catch |err| {
+                        self.allocator.free(subdir_path);
+                        log.warn("Warm start: failed to append subdir: {s}", .{@errorName(err)});
+                    };
+                }
+            }
+            // Free the current_dir path after we're done with it
+            self.allocator.free(current_dir);
+        }
+
+        if (files.items.len == 0) return;
+
+        // Sort lexicographically (oldest first)
+        std.mem.sort([]const u8, files.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+
+        const max_to_load = @min(self.warm_start_max_messages, self.max_history_messages);
+        var records = std.ArrayList(struct { role: providers.Role, content: []u8 }).empty;
+        defer records.deinit(self.allocator);
+
+        // Iterate from newest to oldest
+        var i = files.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (records.items.len >= max_to_load) break;
+            const file_path = files.items[i];
+
+            var file = std.fs.openFileAbsolute(file_path, .{ .mode = .read_only }) catch |err| {
+                log.warn("Warm start: failed to open message file '{s}': {s}", .{file_path, @errorName(err)});
+                continue;
+            };
+            defer file.close();
+
+            const file_stat = fs_compat.stat(file) catch |err| {
+                log.warn("Warm start: failed to stat message file '{s}': {s}", .{file_path, @errorName(err)});
+                continue;
+            };
+            const file_size = file_stat.size;
+
+            var file_buf = self.allocator.alloc(u8, file_size) catch |err| {
+                log.warn("Warm start: allocation failed for file buffer (size {d}): {s}", .{file_size, @errorName(err)});
+                continue;
+            };
+            defer self.allocator.free(file_buf);
+
+            const read_len = file.readAll(file_buf) catch |err| {
+                log.warn("Warm start: failed to read file '{s}': {s}", .{file_path, @errorName(err)});
+                continue;
+            };
+            if (read_len < file_size) {
+                log.warn("Warm start: incomplete read of file '{s}': expected {d}, got {d}", .{file_path, file_size, read_len});
+                continue;
+            }
+
+            const parsed = self.parseMessageFile(file_buf[0..read_len]) catch |err| {
+                log.warn("Warm start: parse error in file '{s}': {s}", .{file_path, @errorName(err)});
+                continue;
+            };
+
+            // Skip system messages
+            if (parsed.role == .system) continue;
+
+            // Enforce session ID match if configured
+            if (self.memory_session_id != null) {
+                if (parsed.session_id == null or !std.mem.eql(u8, parsed.session_id.?, self.memory_session_id.?)) {
+                    continue;
+                }
+            }
+
+            // Duplicate content for history
+            const owned_content = self.allocator.dupe(u8, parsed.content) catch |err| {
+                log.warn("Warm start: allocation failed for content: {s}", .{@errorName(err)});
+                continue;
+            };
+
+            records.append(self.allocator, .{ .role = parsed.role, .content = owned_content }) catch |err| {
+                self.allocator.free(owned_content);
+                log.warn("Warm start: failed to append record: {s}", .{@errorName(err)});
+                continue;
+            };
+        }
+
+        if (records.items.len == 0) return;
+
+        // Reverse to chronological order (oldest first)
+        std.mem.reverse(records.items);
+
+        // Append messages to history in chronological order
+        for (records.items) |rec| {
+            self.appendOwnedHistoryMessage(.{ .role = rec.role, .content = rec.content }, &[_]ParsedToolCall{}, null) catch |err| {
+                log.warn("Warm start: failed to append message to history: {s}", .{@errorName(err)});
+                self.allocator.free(rec.content);
+            };
         }
     }
 

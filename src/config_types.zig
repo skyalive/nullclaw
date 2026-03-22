@@ -242,6 +242,11 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+    /// When true, on agent startup, attempt to reconstruct conversation history
+    /// from previously saved message logs in workspace/messages/.
+    warm_start: bool = false,
+    /// Maximum number of messages to load during warm start (default: 30).
+    warm_start_max_messages: u32 = 30,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
