@@ -1035,7 +1035,7 @@ fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !V
     }
 
     if (community_base) |base| {
-        if (yc.skills.listSkillsMerged(allocator, base, workspace_dir)) |skills| {
+        if (yc.skills.listSkillsMerged(allocator, base, workspace_dir, null)) |skills| {
             return .{
                 .skills = skills,
                 .community_base = base,
@@ -1046,7 +1046,7 @@ fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !V
         }
     }
 
-    const skills = try yc.skills.listSkills(allocator, workspace_dir);
+    const skills = try yc.skills.listSkills(allocator, workspace_dir, null);
     for (skills) |*skill| {
         yc.skills.checkRequirements(allocator, skill);
     }
