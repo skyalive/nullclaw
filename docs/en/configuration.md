@@ -288,6 +288,58 @@ Practical effect:
 - Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
 - `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
 
+### `messages.inbound`
+
+- `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.
+- Default: `3000`.
+- Applies to daemon-routed inbound text and the Agent CLI REPL.
+- Set `0` to disable it.
+- Slash commands and media-bearing inbound messages bypass debounce.
+- Telegram keeps its channel-specific split-message merge path; this setting becomes the base debounce window for that path.
+
+Example:
+
+```json
+{
+  "messages": {
+    "inbound": {
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
+### `reliability`
+
+- Configures global retry and failover behavior for LLM providers.
+- `provider_retries`: Number of times to retry a failed LLM request (default: 2).
+- `provider_backoff_ms`: Initial exponential backoff delay between retries (default: 500).
+- `fallback_providers`: List of provider names to try if an unqualified model should fan out beyond the primary provider.
+- `model_fallbacks`: Mapping of a model to an ordered list of fallback models. Each fallback may be either another bare model name or an explicit `provider/model` ref.
+
+Example:
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
+- Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
+- `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.
@@ -761,6 +813,8 @@ Common issues:
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
 - `auto_save`: persists conversation memory automatically.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
+
+**Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
 
 ### `gateway`
 

@@ -1,6 +1,6 @@
 const std = @import("std");
+const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
-const platform = @import("platform.zig");
 const provider_names = @import("provider_names.zig");
 const secrets = @import("security/secrets.zig");
 pub const config_types = @import("config_types.zig");
@@ -168,6 +168,7 @@ pub const Config = struct {
     runtime: RuntimeConfig = .{},
     reliability: ReliabilityConfig = .{},
     scheduler: SchedulerConfig = .{},
+    messages: config_types.MessagesConfig = .{},
     agent: AgentConfig = .{},
     heartbeat: HeartbeatConfig = .{},
     cron: CronConfig = .{},
@@ -371,15 +372,11 @@ pub const Config = struct {
         }
         const allocator = arena_ptr.allocator();
 
-        // NULLCLAW_HOME overrides the default config directory (~/.nullclaw/).
-        const config_dir = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => blk: {
-                const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
-                break :blk try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
-            },
+        const config_dir = config_paths.defaultConfigDir(allocator) catch |err| switch (err) {
+            error.HomeDirNotFound => return error.NoHomeDir,
             else => return err,
         };
-        const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
+        const config_path = try config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
         const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
         var cfg = Config{
@@ -1093,6 +1090,7 @@ pub const Config = struct {
         // Reliability
         try self.writeReliabilitySection(w, &store);
         try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
+        try w.print("  \"messages\": {f},\n", .{std.json.fmt(self.messages, .{})});
         try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
             .compact_context = self.agent.compact_context,
             .max_tool_iterations = self.agent.max_tool_iterations,
@@ -1433,7 +1431,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.NoDefaultModel => std.debug.print(
-                "No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.\n",
+                "No default model configured. Set agents.defaults.model.primary in config.json in your nullclaw config directory or run `nullclaw onboard`.\n",
                 .{},
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
@@ -2270,6 +2268,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.scheduler.max_tasks = 32;
     cfg.scheduler.max_concurrent = 2;
     cfg.scheduler.agent_timeout_secs = 123;
+    cfg.messages.inbound.debounce_ms = 1500;
 
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 7;
@@ -2403,6 +2402,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
+    try std.testing.expectEqual(@as(u32, 1500), loaded.messages.inbound.debounce_ms);
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
@@ -3327,6 +3327,16 @@ test "json parse scheduler section" {
     try std.testing.expectEqual(@as(u32, 128), cfg.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u32, 8), cfg.scheduler.max_concurrent);
     try std.testing.expectEqual(@as(u64, 600), cfg.scheduler.agent_timeout_secs);
+}
+
+test "json parse messages section reads inbound debounce config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"messages": {"inbound": {"debounce_ms": 1500}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 1500), cfg.messages.inbound.debounce_ms);
 }
 
 test "json parse agent section" {

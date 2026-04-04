@@ -1057,15 +1057,8 @@ const VisibleSkills = struct {
 };
 
 fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !VisibleSkills {
-    const home = yc.platform.getHomeDir(allocator) catch null;
-    defer if (home) |path| allocator.free(path);
-
-    var community_base: ?[]u8 = null;
+    var community_base: ?[]u8 = yc.config_paths.defaultConfigDir(allocator) catch null;
     errdefer if (community_base) |path| allocator.free(path);
-
-    if (home) |path| {
-        community_base = std.fs.path.join(allocator, &.{ path, ".nullclaw" }) catch null;
-    }
 
     if (community_base) |base| {
         if (yc.skills.listSkillsMerged(allocator, base, workspace_dir, null)) |skills| {
@@ -2703,7 +2696,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
     const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, config);
     if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
-        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
+        std.debug.print("No API key configured. Set env var or add to config.json in your nullclaw config directory:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
     }
@@ -2908,6 +2901,22 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     else
         telegram_config.allow_from;
 
+    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
+    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
+        allocator,
+        config.default_provider,
+        config.providers,
+    ) catch null;
+    defer if (resolved_api_key) |k| allocator.free(k);
+
+    // OAuth providers (openai-codex) don't need an API key
+    const provider_kind = yc.providers.classifyProvider(config.default_provider);
+    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, &config);
+    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
+        std.debug.print("No API key configured. Set env var or add to config.json in your nullclaw config directory:\n", .{});
+        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
+        std.process.exit(1);
+    }
     std.debug.print("nullclaw telegram bot starting...\n", .{});
     config.printModelConfig();
     std.debug.print("  Temperature: {d:.1}\n", .{config.default_temperature});
@@ -2936,6 +2945,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
     tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
     tg.commands_menu_mode = telegram_config.commands_menu_mode;
+    tg.text_debounce_secs = yc.channels.telegram.TelegramChannel.textDebounceSecsFromMs(
+        config.messages.inbound.debounce_ms,
+    );
+
     const runtime = yc.channel_loop.ChannelRuntime.init(allocator, &config) catch |err| {
         std.debug.print("Runtime init failed: {}\n", .{err});
         std.process.exit(1);
@@ -3010,7 +3023,7 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
             std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
             std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
-            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
+            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in auth.json in your nullclaw config directory.\n", .{});
         } else {
             std.debug.print("openai-codex: not authenticated\n", .{});
             std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
@@ -3235,7 +3248,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -3289,7 +3302,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 fn printUsage() void {
