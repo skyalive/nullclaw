@@ -13,6 +13,7 @@ const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
+const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
@@ -286,11 +287,75 @@ fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     return false;
 }
 
-fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
-    const slash = std.mem.indexOfScalar(u8, model, '/') orelse return false;
-    if (slash == 0 or slash + 1 >= model.len) return false;
+const PrimaryModelSelectionRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
 
-    const provider_candidate = model[0..slash];
+fn updateExplicitProviderMatch(
+    model_ref: []const u8,
+    provider_name: []const u8,
+    best_provider: *?[]const u8,
+    best_model: *[]const u8,
+    best_provider_len: *usize,
+) void {
+    const split = model_refs.matchExplicitProviderPrefix(model_ref, provider_name) orelse return;
+    const provider = split.provider orelse return;
+    if (provider.len <= best_provider_len.*) return;
+
+    best_provider.* = provider;
+    best_model.* = split.model;
+    best_provider_len.* = provider.len;
+}
+
+fn splitExplicitProviderModelForSelf(self: anytype, model_ref: []const u8) ?PrimaryModelSelectionRef {
+    var best_provider: ?[]const u8 = null;
+    var best_model: []const u8 = undefined;
+    var best_provider_len: usize = 0;
+
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            updateExplicitProviderMatch(model_ref, entry.name, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (@hasField(@TypeOf(self.*), "model_routes")) {
+        for (self.model_routes) |route| {
+            updateExplicitProviderMatch(model_ref, route.provider, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (@hasField(@TypeOf(self.*), "fallback_providers")) {
+        for (self.fallback_providers) |provider_name| {
+            updateExplicitProviderMatch(model_ref, provider_name, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (best_provider) |provider| {
+        return .{
+            .provider = provider,
+            .model = best_model,
+        };
+    }
+    return null;
+}
+
+fn splitPrimaryModelRefForSelf(self: anytype, primary: []const u8) ?PrimaryModelSelectionRef {
+    if (splitExplicitProviderModelForSelf(self, primary)) |split| return split;
+    if (config_module.splitPrimaryModelRef(primary)) |split| {
+        return .{
+            .provider = split.provider,
+            .model = split.model,
+        };
+    }
+    return null;
+}
+
+fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
+    if (splitExplicitProviderModelForSelf(self, model) != null) return true;
+
+    const split = model_refs.splitProviderModel(model) orelse return false;
+    const provider_candidate = split.provider orelse return false;
     if (providers.classifyProvider(provider_candidate) != .unknown) return true;
 
     var lower_buf: [128]u8 = undefined;
@@ -317,17 +382,54 @@ fn configPrimaryModelForSelection(self: anytype, model: []const u8) ![]u8 {
     return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
 }
 
+fn primaryModelProviderObjectJson(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    model: []const u8,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var model_obj = std.json.ObjectMap.init(arena.allocator());
+    try model_obj.put("provider", .{ .string = provider });
+    try model_obj.put("primary", .{ .string = model });
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
+}
+
+fn configPrimaryModelMutationValue(self: anytype, model: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, model, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPath;
+
+    if (hasExplicitProviderPrefix(self, trimmed)) {
+        if (splitPrimaryModelRefForSelf(self, trimmed)) |split| {
+            if (config_module.shouldSerializeDefaultModelProviderField(split.provider)) {
+                return try primaryModelProviderObjectJson(self.allocator, split.provider, split.model);
+            }
+        }
+        return try self.allocator.dupe(u8, trimmed);
+    }
+
+    const provider = if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0)
+        self.default_provider
+    else
+        "openrouter";
+    if (config_module.shouldSerializeDefaultModelProviderField(provider)) {
+        return try primaryModelProviderObjectJson(self.allocator, provider, trimmed);
+    }
+    return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
+}
+
 fn persistSelectedModelToConfig(self: anytype, model: []const u8) !void {
     if (builtin.is_test) return;
 
-    const primary = try configPrimaryModelForSelection(self, model);
-    defer self.allocator.free(primary);
+    const value_raw = try configPrimaryModelMutationValue(self, model);
+    defer self.allocator.free(value_raw);
 
     var result = try config_mutator.mutateDefaultConfig(
         self.allocator,
         .set,
         "agents.defaults.model.primary",
-        primary,
+        value_raw,
         .{ .apply = true },
     );
     defer config_mutator.freeMutationResult(self.allocator, &result);
@@ -421,6 +523,81 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
     const primary = try configPrimaryModelForSelection(&dummy, "customgw/model-a");
     defer allocator.free(primary);
     try std.testing.expectEqualStrings("customgw/model-a", primary);
+}
+
+test "configPrimaryModelForSelection keeps explicit custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model", primary);
+}
+
+test "configPrimaryModelForSelection keeps versionless custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://example.com/gpt-4o");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://example.com/gpt-4o", primary);
+}
+
+test "configPrimaryModelMutationValue serializes versionless custom defaults as object" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "custom:https://example.com/api",
+        .configured_providers = &.{},
+    };
+
+    const value_raw = try configPrimaryModelMutationValue(&dummy, "meta-llama/Llama-4-70B-Instruct");
+    defer allocator.free(value_raw);
+
+    try std.testing.expectEqualStrings(
+        "{\"provider\":\"custom:https://example.com/api\",\"primary\":\"meta-llama/Llama-4-70B-Instruct\"}",
+        value_raw,
+    );
+}
+
+test "configPrimaryModelForSelection keeps configured versionless custom url namespace ref" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://gateway.example.com" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &configured,
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://gateway.example.com/qianfan/custom-model");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/qianfan/custom-model", primary);
 }
 
 test "bareSessionResetPrompt returns prompt for bare /new" {
@@ -612,6 +789,188 @@ test "hotApplyConfigChange model primary refreshes token and max token limits" {
     try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
     try std.testing.expectEqual(@as(u64, 128_000), dummy.token_limit);
     try std.testing.expectEqual(@as(u32, 8192), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates custom url model primary" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://api.example.com/openai/v2/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates configured versionless custom url model primary" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://gateway.example.com" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .configured_providers = &configured,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://gateway.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates route-only custom url model primary" {
+    // Regression: hot reload must preserve explicit providers that exist only in model_routes.
+    const allocator = std.testing.allocator;
+    const routes = [_]config_types.ModelRouteConfig{
+        .{
+            .hint = "fast",
+            .provider = "custom:https://route.example.com/qianfan",
+            .model = "custom-model",
+        },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        model_routes: []const config_types.ModelRouteConfig,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .model_routes = &routes,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://route.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://route.example.com/qianfan", dummy.default_provider);
+}
+
+test "hotApplyConfigChange updates fallback-only custom url model primary" {
+    // Regression: hot reload must preserve explicit providers that exist only in reliability fallbacks.
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        fallback_providers: []const []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .fallback_providers = &.{"custom:https://fb.example.com/qianfan"},
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://fb.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://fb.example.com/qianfan", dummy.default_provider);
 }
 
 test "hotApplyConfigChange updates agent status_show_emojis" {
@@ -933,10 +1292,27 @@ test "splitPrimaryModelRef parses versioned custom provider model format" {
     try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", parsed.model);
 }
 
+test "splitPrimaryModelRef parses versionless custom provider model format" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://example.com/api/qianfan/custom-model",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/api", parsed.provider);
+    try std.testing.expectEqualStrings("qianfan/custom-model", parsed.model);
+}
+
+test "splitPrimaryModelRef preserves custom url endpoint suffixes" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://my-api.example.com/api/v2/responses/my-model",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://my-api.example.com/api/v2/responses", parsed.provider);
+    try std.testing.expectEqualStrings("my-model", parsed.model);
+}
+
 test "splitPrimaryModelRef rejects malformed values" {
     try std.testing.expect(config_module.splitPrimaryModelRef("noslash") == null);
     try std.testing.expect(config_module.splitPrimaryModelRef("/model-only") == null);
     try std.testing.expect(config_module.splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("custom:https://api.example.com/v1/") == null);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -1148,7 +1524,7 @@ fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_in
 }
 
 fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch return null;
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch return null;
     defer skills_mod.freeSkills(self.allocator, skills);
 
     var resolved: ?DirectSkillCommandMatch = null;
@@ -2684,12 +3060,19 @@ fn parseJsonBool(raw: []const u8) ?bool {
 }
 
 fn parseHotReloadPrimaryModelRef(
+    self: anytype,
     allocator: std.mem.Allocator,
     raw: []const u8,
 ) !?config_module.PrimaryModelRef {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
     return switch (parsed.value) {
-        .string => |primary| config_module.splitPrimaryModelRef(primary),
+        .string => |primary| if (splitPrimaryModelRefForSelf(self, primary)) |split|
+            config_module.PrimaryModelRef{
+                .provider = split.provider,
+                .model = split.model,
+            }
+        else
+            null,
         .object => |obj| blk: {
             const provider_val = obj.get("provider") orelse break :blk null;
             const primary_val = obj.get("primary") orelse break :blk null;
@@ -2730,7 +3113,7 @@ fn hotApplyConfigChange(
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const parsed = try parseHotReloadPrimaryModelRef(arena.allocator(), new_value_json) orelse return false;
+        const parsed = try parseHotReloadPrimaryModelRef(self, arena.allocator(), new_value_json) orelse return false;
         try setModelName(self, parsed.model);
         try setDefaultProvider(self, parsed.provider);
         if (@hasField(@TypeOf(self.*), "default_model")) {
@@ -3242,7 +3625,7 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
     }
 
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };
     defer skills_mod.freeSkills(self.allocator, skills);

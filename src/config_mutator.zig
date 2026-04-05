@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
+const config_paths = @import("config_paths.zig");
 const platform = @import("platform.zig");
 
 pub const MutationAction = enum {
@@ -68,17 +69,13 @@ pub fn freeMutationResult(allocator: std.mem.Allocator, result: *MutationResult)
 }
 
 fn defaultConfigDir(allocator: std.mem.Allocator, nullclaw_home_override: ?[]const u8) ![]u8 {
-    if (nullclaw_home_override) |config_dir| {
-        return allocator.dupe(u8, config_dir);
-    }
-
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    return config_paths.defaultConfigDirFromInputs(allocator, nullclaw_home_override, home);
 }
 
 fn defaultConfigPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]u8 {
-    return try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
+    return config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
 }
 
 pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
@@ -533,6 +530,22 @@ test "stringifyPathValueJson reconstructs logical default model primary" {
         "\"custom:https://example.com/api/meta-llama/Llama-4-70B-Instruct\"",
         value_json,
     );
+}
+
+test "setPrimaryModelPathValue stores split provider field for versionless custom urls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
+
+    try setPrimaryModelPathValue(&root, a, "custom:https://gateway.example.com/api/qianfan/custom-model");
+
+    const provider_value = valueAtPath(&root, &primary_model_provider_tokens) orelse return error.TestUnexpectedResult;
+    const primary_value = valueAtPath(&root, &primary_model_tokens) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(provider_value.* == .string);
+    try std.testing.expect(primary_value.* == .string);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/api", provider_value.string);
+    try std.testing.expectEqualStrings("qianfan/custom-model", primary_value.string);
 }
 
 test "setPrimaryModelPathValue clears stale split provider field" {
