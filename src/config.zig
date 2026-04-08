@@ -1321,6 +1321,7 @@ pub const Config = struct {
         InvalidWebRelayUiTokenTtl,
         InvalidWebRelayTokenTtl,
         ReservedMainAgentName,
+        UnknownAgentProvider,
         InsecurePlaintextSecrets,
     };
 
@@ -1536,6 +1537,7 @@ pub const Config = struct {
             ValidationError.InvalidWebRelayUiTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_ui_token_ttl_secs must be in [300, 2592000].\n", .{}),
             ValidationError.InvalidWebRelayTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_token_ttl_secs must be in [3600, 31536000].\n", .{}),
             ValidationError.ReservedMainAgentName => std.debug.print("Config error: agents.list names must not normalize to 'main' because that id is reserved for the root agent.\n", .{}),
+            ValidationError.UnknownAgentProvider => std.debug.print("Config error: agents.list[].provider must match a known provider name.\n", .{}),
         }
     }
 
@@ -6619,4 +6621,23 @@ test "NostrConfig dm_relays default is auth.nostr1.com" {
     };
     try std.testing.expectEqual(@as(usize, 1), cfg.dm_relays.len);
     try std.testing.expectEqualStrings("wss://auth.nostr1.com", cfg.dm_relays[0]);
+}
+
+// Regression: named agent provider name not validated against known providers
+test "validation rejects named agent with unknown provider" {
+    const agents = [_]NamedAgentConfig{
+        .{
+            .name = "researcher",
+            .provider = "nonexistent-provider",
+            .model = "some-model",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openrouter/claude-sonnet-4",
+        .agents = &agents,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(Config.ValidationError.UnknownAgentProvider, cfg.validate());
 }
