@@ -137,7 +137,17 @@ test "createNoopSandbox returns functional sandbox" {
 }
 
 test "SandboxBackend enum exhaustiveness" {
-    inline for (.{ SandboxBackend.auto, SandboxBackend.none, SandboxBackend.landlock, SandboxBackend.firejail, SandboxBackend.bubblewrap, SandboxBackend.docker }) |backend| {
-        try testing.expect(@as(SandboxBackend, backend) == backend);
+    const expected_names = [_][]const u8{
+        "auto",
+        "none",
+        "landlock",
+        "firejail",
+        "bubblewrap",
+        "docker",
+    };
+    const enum_fields = @typeInfo(SandboxBackend).@"enum".fields;
+    try testing.expectEqual(expected_names.len, enum_fields.len);
+    inline for (expected_names, 0..) |expected_name, i| {
+        try testing.expectEqualStrings(expected_name, enum_fields[i].name);
     }
 }
